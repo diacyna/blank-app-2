@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
-import rasterio
+import os
+import glob
 import folium
 from PIL import Image
 import numpy as np
@@ -11,6 +12,16 @@ import seaborn as sns
 from streamlit_folium import st_folium
 import io
 
+# Optional rasterio -- may fail if libgdal is missing in the environment.
+try:
+    import rasterio
+    from rasterio import transform as rio_transform
+    has_rasterio = True
+except Exception:
+    rasterio = None
+    rio_transform = None
+    has_rasterio = False
+
 def dm_to_dd(degrees, minutes):
     """Converts degrees and minutes to decimal degrees."""
     return degrees + minutes / 60
@@ -20,11 +31,31 @@ st.title('Georeferencing and Geological Data Viewer')
 
 st.write("Upload your image (e.g., screenshot) and Excel file with geological coordinates.")
 
+uploads_dir = os.path.join(os.getcwd(), 'uploads')
+os.makedirs(uploads_dir, exist_ok=True)
+
+# Always use the on-site uploader: der Benutzer lädt beide Dateien hoch.
 image_file = st.file_uploader("Upload Image (PNG/JPG)", type=['png', 'jpg', 'jpeg'])
 excel_file = st.file_uploader("Upload Excel File (.xlsx)", type=['xlsx'])
 
 if image_file and excel_file:
-    st.success("Files uploaded successfully! Starting processing...")
+    st.success("Files provided — starte Verarbeitung...")
+
+    # Save uploaded files into uploads/ for record and later reuse
+    try:
+        img_bytes = image_file.getvalue() if hasattr(image_file, 'getvalue') else image_file.read()
+        img_name = getattr(image_file, 'name', 'uploaded_image.png')
+        with open(os.path.join(uploads_dir, img_name), 'wb') as f:
+            f.write(img_bytes)
+    except Exception:
+        pass
+    try:
+        excel_bytes = excel_file.getvalue() if hasattr(excel_file, 'getvalue') else excel_file.read()
+        excel_name = getattr(excel_file, 'name', 'uploaded_coords.xlsx')
+        with open(os.path.join(uploads_dir, excel_name), 'wb') as f:
+            f.write(excel_bytes)
+    except Exception:
+        pass
 
     # Temporary paths for processing
     input_image_path = io.BytesIO(image_file.getvalue())
@@ -47,46 +78,63 @@ if image_file and excel_file:
     img = Image.open(input_image_path)
     img_array = np.array(img)
 
-    # Get image dimensions
-    height, width, bands = img_array.shape
+    # Get image dimensions (handle grayscale or RGB/RGBA)
+    if img_array.ndim == 2:
+        height, width = img_array.shape
+        bands = 1
+    else:
+        height, width, bands = img_array.shape
 
-    # Define the spatial transform for the GeoTIFF
-    transform = rasterio.transform.from_bounds(west, south, east, north, width, height)
+    # If rasterio (and GDAL) is available, create a GeoTIFF; otherwise fall back to the original image
+    if has_rasterio:
+        transform = rasterio.transform.from_bounds(west, south, east, north, width, height)
 
-    # Define the Coordinate Reference System (CRS) - WGS84 for lat/lon
-    crs = 'EPSG:4326'
+        # Define the Coordinate Reference System (CRS) - WGS84 for lat/lon
+        crs = 'EPSG:4326'
 
-    # Write the image as a GeoTIFF
-    with rasterio.open(
-        output_geotiff_path,
-        'w',
-        driver='GTiff',
-        height=height,
-        width=width,
-        count=bands,
-        dtype=img_array.dtype,
-        crs=crs,
-        transform=transform,
-    ) as dst:
-        for i in range(bands):
-            dst.write(img_array[:, :, i], i + 1)
-    st.success(f"Image successfully georeferenced to {output_geotiff_path}")
+        # Write the image as a GeoTIFF
+        with rasterio.open(
+            output_geotiff_path,
+            'w',
+            driver='GTiff',
+            height=height,
+            width=width,
+            count=bands,
+            dtype=img_array.dtype,
+            crs=crs,
+            transform=transform,
+        ) as dst:
+            if bands == 1:
+                dst.write(img_array, 1)
+            else:
+                for i in range(bands):
+                    dst.write(img_array[:, :, i], i + 1)
+        st.success(f"Image successfully georeferenced to {output_geotiff_path}")
 
-    # Convert GeoTIFF to PNG for Folium overlay (if original was not PNG already)
-    with rasterio.open(output_geotiff_path) as src:
-        geotiff_data = src.read()
-        if src.count == 4:
-            pil_image_array = np.transpose(geotiff_data, (1, 2, 0)).astype(np.uint8)
-            pil_img = Image.fromarray(pil_image_array, 'RGBA')
-        elif src.count == 3:
-            pil_image_array = np.transpose(geotiff_data, (1, 2, 0)).astype(np.uint8)
-            pil_img = Image.fromarray(pil_image_array, 'RGB')
-        else:
-            pil_image_array = geotiff_data[0, :, :].astype(np.uint8)
-            pil_img = Image.fromarray(pil_image_array, 'L')
+        # Convert GeoTIFF to PNG for Folium overlay (if original was not PNG already)
+        with rasterio.open(output_geotiff_path) as src:
+            geotiff_data = src.read()
+            if src.count == 4:
+                pil_image_array = np.transpose(geotiff_data, (1, 2, 0)).astype(np.uint8)
+                pil_img = Image.fromarray(pil_image_array, 'RGBA')
+            elif src.count == 3:
+                pil_image_array = np.transpose(geotiff_data, (1, 2, 0)).astype(np.uint8)
+                pil_img = Image.fromarray(pil_image_array, 'RGB')
+            else:
+                pil_image_array = geotiff_data[0, :, :].astype(np.uint8)
+                pil_img = Image.fromarray(pil_image_array, 'L')
 
-        pil_img.save(output_png_path)
-    st.success(f"GeoTIFF converted to PNG for display: {output_png_path}")
+            pil_img.save(output_png_path)
+        st.success(f"GeoTIFF converted to PNG for display: {output_png_path}")
+    else:
+        # Fallback: save the uploaded image directly for overlay (no GeoTIFF)
+        try:
+            pil_img = img.convert('RGBA') if img.mode in ('RGBA', 'RGB') else img.convert('RGB')
+            pil_img.save(output_png_path)
+            st.warning("rasterio/GDAL nicht verfügbar — Bild wird ohne GeoTIFF-Generierung angezeigt.")
+        except Exception as e:
+            st.error(f"Fehler beim Verarbeiten des Bildes ohne rasterio: {e}")
+            st.stop()
 
 
     ### 2. Convert Coordinates
